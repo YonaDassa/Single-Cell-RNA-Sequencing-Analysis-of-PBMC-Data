@@ -1,0 +1,405 @@
+---
+title: "Single-Cell RNA Sequencing Analysis of PBMC Data"
+output: pdf_document
+date: "2025-04-20"
+---
+
+```{r setup, include=FALSE}
+# General settings for the report
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 6, fig.height = 4, dpi = 72)
+```
+
+# Introduction: Single-Cell RNA-Seq Analysis of PBMCs
+
+This report presents an analysis of single-cell RNA sequencing (scRNA-seq) data from Peripheral Blood Mononuclear Cells (PBMCs). PBMCs are a diverse population of immune cells that circulate in the bloodstream, including T cells, B cells, NK cells, monocytes, dendritic cells, and platelets. Understanding the heterogeneity and gene expression patterns in these cells is crucial for immunology research and clinical applications.
+
+## Dataset Description Biological context:
+
+Organism: Human (Homo sapiens) 
+Tissue: Blood (specifically PBMCs) 
+Technology: 10x Genomics Chromium Single-Cell Gene Expression 
+Sample size: \~3,000 cells 
+Sequencing platform: Illumina NextSeq 500
+
+# Analysis Workflow
+
+1.  Data loading and quality control
+2.  Normalization and feature selection
+3.  Dimensionality reduction (PCA, UMAP, t-SNE)
+4.  Clustering
+5.  Marker gene identification
+6.  Cell type annotation using SingleR
+
+# Data loading and quality control
+
+## Data Loading and Initial Processing
+
+We begin by loading the necessary R libraries. dplyr is used for data manipulation, Seurat is the main package for single-cell RNA-seq analysis, and patchwork helps in combining multiple plots.
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+```
+
+Next, We load the single-cell dataset of peripheral blood mononuclear cells (PBMCs) from 10X Genomics. The data includes raw gene expression counts. We create a Seurat object:
+
+```{r init}
+# Load the PBMC dataset
+data_dir <- "C:/Users/Admin/MLbio/"
+pbmc.data <- Read10X(data.dir = data_dir)
+
+# Initialize the Seurat object with the raw (non-normalized data).
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc
+```
+
+Genes must be expressed in at least 3 cells and cells must have at least 200 detected genes to be retained.
+
+This ensures that both low-quality genes and low-quality cells are excluded from downstream analyses.
+
+The initialized Seurat object contains expression data for 13,714 genes (features) across 2,700 single cells (samples), indicating a relatively rich dataset following initial filtering. The active assay is set to "RNA", meaning that downstream analyses will focus on gene expression profiles. At this stage, no highly variable genes have been selected yet (0 variable features), which typically occurs in later preprocessing steps. Only one data layer—"counts"—is present, representing raw, unnormalized gene expression values. This setup forms the foundational input for subsequent analyses.
+
+During the creation of the Seurat object, initial filtering criteria are applied to improve data quality:
+**min.cells = 3**: Each gene must be detected in at least 3 cells to be included. This filters out genes that might be technical artifacts or extremely rare transcripts.
+
+**min.features = 200**: Each cell must express at least 200 genes to be included. This removes likely empty droplets or severely damaged cells.
+
+Additionally, we calculate the percentage of mitochondrial gene expression per cell using genes that begin with the prefix "MT-". A high proportion of mitochondrial transcripts often suggests stressed or dying cells and can be used later to flag or exclude low-quality cells from the dataset.
+
+Let's examine what the raw count matrix looks like for a few genes across the first 30 cells:
+
+```{r}
+# Examine a few genes in the first thirty cells
+pbmc.data[c("CD3D","TCL1A","MS4A1"), 1:30]
+```
+The extracted count matrix displays the raw expression levels (UMI counts) of three key marker genes—**CD3D**, **TCL1A**, and **MS4A1**—across the first 30 cells. These genes are commonly used to identify major immune cell types: CD3D marks T cells, TCL1A is associated with naïve B cells, and MS4A1 (CD20) marks mature B cells. The values indicate the number of unique RNA molecules detected for each gene in each cell. Cells with a dot (“.”) have zero expression for that gene, highlighting the sparsity typical of single-cell RNA-seq data. 
+Notably, CD3D shows broad expression across multiple cells, suggesting the presence of T cells, while MS4A1 has high expression in specific cells (e.g., cell 21), consistent with B cell identity. This early inspection helps validate the data and provides an initial glimpse into the sample.
+
+## Quality Control
+
+Before proceeding with analysis, we need to identify and filter out low-quality cells. Common quality control metrics include number of unique genes detected per cell (feature count), total number of molecules detected per cell (count depth), and percentage of reads mapping to mitochondrial genes
+
+```{r}
+# Calculate percentage of mitochondrial genes
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+# Visualize QC metrics as violin plots
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Visualize feature-feature relationships
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+Looking at these QC plots helps us determine appropriate filtering thresholds:
+
+1.  **nFeature_RNA** - genes per cell: Cells with too few genes are likely empty droplets or poor-quality cells. Cells with too many genes could be doublets. Based on that, we'll filter cells to keep those with between 200 and 2,500 genes.
+
+2.  **percent.mt** - mitochondrial percentage: High mitochondrial content indicates dying or stressed cells where cytoplasmic RNA has leaked out but mitochondrial RNA remains. We'll use a 5% threshold.
+
+3.  The **scatter plot** shows a strong correlation between gene count and molecule count, which is expected. 
+This suggests the data has good technical quality. A high Pearson correlation coefficient (R = 0.95) between the number of detected genes (nFeature_RNA) and total RNA molecules (nCount_RNA) indicates that as the sequencing depth increases, more unique genes are consistently captured rather than just increasing redundancy of already abundant transcripts.
+This linear relationship implies that the dataset is not heavily biased by technical noise or over-amplification, and supports the assumption that differences in gene detection across cells are biologically meaningful rather than technical artifacts.
+
+
+
+Now we apply the filtering:
+
+```{r}
+# Filter cells based on QC metrics
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+# Normalization and Feature Selection
+
+After quality control, we normalize the data to account for differences in sequencing depth between cells.
+
+```{r}
+# Normalize data
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+This approach works by scaling the expression of each gene in each cell by the total expression in that cell, multiplying by a scale factor (here, 10,000), and then applying a natural logarithm transformation. This helps stabilize variance across genes and cells and prepares the data for downstream analyses such as dimensionality reduction and clustering. 
+
+Next, we identify the most variable genes, which will be used for downstream analysis:
+
+```{r, fig.width=8, fig.height=6}
+# Find variable features
+pbmc <- FindVariableFeatures(pbmc, selection.method = 'vst', nfeatures = 2000)
+
+# Plot variable features
+top10 <- head(VariableFeatures(pbmc), 10)
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+The variable feature plots above illustrate the relationship between average gene expression (x-axis) and standardized variance (y-axis) across all cells. In the left panel, the 2,000 most variable genes are highlighted in red against the background of all genes (black). The right panel identifies some of the top variable genes, including markers like PPBP (platelet factor), S100A8 (found in neutrophils), GNLY (natural killer cells), and IGLL5 (B cells). These highly variable genes often correspond to cell-type-specific markers that help distinguish between different cell populations in the PBMC sample. Genes with both high expression and high variance are particularly valuable for downstream analysis as they provide robust signals for cell type identification.
+
+Before dimensional reduction, we scale the data:
+```{r}
+# Scale data
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+```
+Scaling involves centering the expression of each gene so that it has a mean of zero and scaling it to have unit variance. Without this step, highly expressed genes could disproportionately influence the results. Scaling is a standard and essential preprocessing procedure that improves the performance and interpretability of techniques such as PCA and clustering.
+
+# Dimensionality Reduction
+## Principal Component Analysis (PCA)
+
+First, we performed linear dimensionality reduction using PCA:
+```{r}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+```
+
+PCA transforms our high-dimensional expression data into a lower-dimensional space where each dimension (principal component) captures a direction of maximum variation in the data. Looking at the top genes contributing to each PC helps us understand what biological signals are being captured:
+
+```{r}
+# Inspect PCA results
+print(pbmc[['pca']], dims = 1:5, nfeatures = 5)
+```
+
+This table shows which genes drive separation along each principal component.
+
+**PC1** Enriched for genes like CST3 and TYROBP (myeloid/monocyte markers) vs. IL7R, CD2, IL32 (lymphoid markers), indicating separation between lymphoid and myeloid lineages.
+
+**PC2** Highlights B cell markers (CD79A, MS4A1) vs. cytotoxic markers (GZMB, PRF1), distinguishing B cells from NK/T cells.
+
+```{r}
+# Visualize the gene loadings for PC1 and PC2
+VizDimLoadings(pbmc, dims = 1:2, reduction = 'pca')
+```
+
+Each gene is plotted according to its contribution to the PC axes. For example, in PC1, we see a tradeoff between genes like TYROBP and CST3 (monocyte markers) vs. IL32 and CD2 (T cell markers). This visual representation helps interpret the biological meaning of each component.
+
+We now plot the cells projected into the space defined by the first two PCs:
+
+
+```{r}
+# Plot cells projected onto the first two PCs
+DimPlot(pbmc, reduction = 'pca')
+```
+
+From these plots we learn that PC1 separates lymphocytes (T and B cells) from monocytes, and PC2 further distinguishes B cells from cytotoxic T/NK cells.
+
+Finally, we visualize a heatmap of gene expression patterns for PC1:
+
+```{r}
+# Heatmap for PC1
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+
+The heatmap shows mutually exclusive expression patterns:
+
+Genes like IL32, CD3D, and CD2 are highly expressed in one group of cells (likely T cells).
+
+Genes like CST3 and TYROBP are expressed in a different group (possibly monocytes).
+This confirms that PC1 captures variation linked to major immune lineages.
+
+
+## Determining the 'Dimensionality' of the Dataset
+
+After running PCA, we need to determine how many principal components (PCs) to include in the downstream analysis. Using too many PCs may introduce noise; too few, and we risk missing important biological signals. Here we use both statistical and heuristic approaches.
+
+**JackStraw Plot:** 
+```{r}
+# Perform JackStraw analysis
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:15)
+```
+The JackStraw analysis tests whether the variation captured by each PC is greater than expected by chance.
+
+PCs 1–13 all have small p-values, suggesting they capture statistically significant biological variation.
+PCs 14 and 15 are not significant, indicating that they likely represent noise.
+
+**Elbow Plot:** To determine how many PCs to retain for downstream analysis, we also examined the elbow plot, which shows the standard deviation of each principal component.
+
+```{r}
+ElbowPlot(pbmc)
+
+```
+
+The Elbow Plot shows the standard deviation of each PC, reflecting the amount of variance it explains.
+
+The "elbow point" — where the curve starts to flatten — suggests that additional PCs contribute diminishing returns.
+
+In this case, the elbow appears around PC5–7.
+To balance biological relevance and noise reduction, we will use the first 5 PCs for further analysis
+
+## Cell Clustering and Non-linear Dimensionality Reduction
+
+After performing the analysis on the PBMC cells, we proceed with clustering to identify groups of cells with similar gene expression profiles. 
+
+```{r}
+# Find neighbors and clusters
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+```
+The clustering approach includes:
+
+FindNeighbors: Constructs a K-nearest neighbors (KNN) graph in the PCA space, meaning it connects cells with similar profiles.
+
+FindClusters: Uses the Louvain algorithm to identify communities (clusters) of cells that are highly similar.
+
+Results: The number of clusters identified: 9.
+
+To visualize the clusters in 2D space, we run both UMAP and t-SNE:
+```{r}
+# Run UMAP
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+umap_plot <- DimPlot(pbmc, reduction = 'umap', label = TRUE)
+umap_plot
+```
+
+The plot shows the cells in a 2D space, where each point represents a cell, and the colors represent the different clusters. We can observe 9 distinct clusters.
+
+```{r}
+# Run t-SNE
+pbmc <- RunTSNE(pbmc, dims = 1:10)
+tsne_plot <- DimPlot(pbmc, reduction = 'tsne', label = TRUE)
+tsne_plot
+```
+
+Similarly, we get a plot where each point represents a cell, and the colors indicate the cluster assignments. We also see 9 distinct clusters in the t-SNE plot.
+
+Both UMAP and t-SNE are non-linear dimensionality reduction techniques that preserve local neighborhood relationships better than PCA.  The UMAP and t-SNE plots show 9 distinct clusters, suggesting at least 9 different cell populations in our PBMC sample. UMAP tends to better preserve both local and global structure of the data compared to t-SNE, which is why it's becoming the preferred visualization method.
+
+## Finding Differentially Expressed Features (Cluster Biomarkers)
+After clustering, the next crucial step is to identify markers that define each cluster. These marker genes help us assign biological identity to the clusters.
+```{r}
+# Find markers for cluster 2
+cluster2.markers <- FindMarkers(pbmc, ident.1 = 2, min.pct = 0.25)
+head(cluster2.markers, n = 5)
+```
+
+**min.pct:** Minimum percentage of cells in either group that must express the gene.
+
+**logfc.threshold:** Minimum fold change in expression between the two groups.
+Result shows genes like IL32, LTB, CD3D, etc., along with their statistical significance (p-value), fold change (avg_log2FC), and other metrics.
+
+### Finding Markers for All Clusters
+To identify markers for all clusters at once:
+```{r}
+# Find all markers for all clusters
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+# Display top 2 markers per cluster
+pbmc.markers %>% group_by(cluster) %>% slice_max(n = 2, order_by = avg_log2FC)
+```
+
+This identifies markers for each cluster. The result shows the top 2 markers for each cluster. For example:
+Cluster 0: CCR7, LEF1
+Cluster 1: FOLR3, S100A12
+Cluster 2: AQP3, CD40LG
+And so on...
+
+Once markers are identified, we can visualize their expression using several types of plots:
+
+1.**Violin Plots:** display the distribution of expression levels for a given marker across different clusters:
+```{r}
+# Violin plots for B cell markers
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"))
+```
+This shows how markers like MS4A1 and CD79A are expressed across different clusters. We see that for marker 3 it is the highst.
+
+2.**Feature Plots:** visualize gene expression overlaid on the UMAP or t-SNE embeddings:
+```{r}
+# Feature plots for key cell type markers
+FeaturePlot(pbmc, features = c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP", "CD8A"))
+```
+
+This helps to see the spatial distribution of different cell types based on their marker gene expression.
+
+**Heatmaps:** Visualize top markers across all clusters
+```{r}
+# Heatmap of top 10 markers per cluster
+pbmc.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(pbmc, features = top10$gene) + NoLegend()
+```
+
+This produces a heatmap of the top 10 markers per cluster, allowing to easily compare expression levels across clusters.
+##להוסיף
+
+Based on these marker genes, we can assign cell type identities to each cluster:
+
+Clusters expressing **MS4A1, CD79A: B cells**
+Clusters expressing **CD3E, CD8A: T cells**
+Clusters expressing **CD14, LYZ: Monocytes**
+Clusters expressing **FCER1A: Dendritic cells**
+Clusters expressing **GNLY, NKG7: NK cells**
+Clusters expressing **PPBP: Megakaryocytes**
+
+The marker analysis is a critical step in single-cell RNA-seq analysis as it allows us to assign biological meaning to the computational clusters, translating them into recognizable cell types or states that can be interpreted in a biological context.
+
+# Cell type annotation using SingleR
+
+Instead of manually identifying cell types using known marker genes, we used SingleR, an automated tool that matches each cell’s gene expression profile to reference datasets of known human cell types.SingleR takes each cell from our dataset, compares its gene expression to reference profiles (from the HumanPrimaryCellAtlas), and finds the most similar cell type and assigns that label.
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(SingleR)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+
+
+# Load the PBMC dataset
+data_dir <- "C:/Users/Admin/MLbio/"  # Update the directory path accordingly
+pbmc.data <- Read10X(data.dir = data_dir)
+
+# Create Seurat object
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+
+# Check the Seurat object
+pbmc
+
+# Convert Seurat object to SingleCellExperiment
+pbmc_sce <- as.SingleCellExperiment(pbmc)
+
+# Set reference dataset for SingleR
+ref <- celldex::HumanPrimaryCellAtlasData()
+
+# Run SingleR with main labels
+results <- SingleR(test = pbmc_sce, ref = ref, labels = ref$label.main)
+
+# Add SingleR labels to Seurat object
+pbmc$singlr_labels <- results$labels
+
+# Visualize SingleR annotations using UMAP
+DimPlot(pbmc, reduction = 'umap', group.by = 'singlr_labels', label = TRUE, label.size = 3, repel = TRUE)
+
+```
+
+#להוסיף Conclusion
+
+We can also use SingleR's fine-grained labels for more specific annotations:
+
+```{r}
+# Run SingleR with fine labels
+results_2 <- SingleR(test = pbmc_sce, ref = ref, labels = ref$label.fine)
+pbmc$singlr_labels_fine <- results_2$labels
+
+# Visualize fine-grained annotations
+DimPlot(pbmc, reduction = 'umap', group.by = 'singlr_labels_fine', label = TRUE)
+```
+
+The fine-grained labels provide more specific cell type identifications, distinguishing between:
+
+This automated approach provides validation for our manual annotations and adds further resolution to our understanding of the cellular composition of the sample.
+
+# Conclusions
+This analysis of the PBMC dataset has revealed:
+
+1. Nine distinct cell clusters representing major immune cell populations
+2. Clear gene expression signatures that distinguish each cell type
+3. Consistent cell type annotations between manual and automated methods
+4. Expected proportions of different immune cells in peripheral blood
+
+This analysis demonstrates the power of single-cell RNA sequencing to:
+Resolve cellular heterogeneity
+Identify cell types without prior sorting
+Discover gene expression patterns specific to each cell population
+Provide comprehensive profiling of complex tissues
